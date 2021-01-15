@@ -68,9 +68,13 @@ type Raft struct {
 	votedFor int
 	log []LogEntry
 	
-	//volatile
-	CommitIndex int
-	LastApplied int
+	//volatile on each server
+	commitIndex int
+	lastApplied int
+
+	//volative on leader to track
+	nextIndex []int
+	mathchIndex []int
 
 	//for live check
 	leaderIndex int
@@ -131,9 +135,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -161,7 +162,7 @@ type AppendEntriesArgs struct {
 	LeaderId int
 	PrevLogIndex int
 	PrevLogTerm int
-	Entries []interface{}
+	Entries []LogEntry
 	LeaderCommit int
 }
 
@@ -170,16 +171,15 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
-	//heartbeat 
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	
 	rf.mx.Lock()
 	defer rf.mx.Unlock()
-	
 	//stale leader
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		return 
+		return
 	}
 
 	//leader heartbeat
@@ -187,39 +187,65 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.leaderIndex = args.LeaderId
 	rf.votedFor = NotVoted
 	
+	reply.Term = rf.currentTerm
+	reply.Success = true
+	
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 	}
+
+	//update follower commitIndex
+	if args.LeaderCommit > rf.commitIndex {
+		msg := ApplyMsg{}
+
+		if args.LeaderCommit < len(rf.log) - 1 {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = len(rf.log) - 1
+		}
+		msg.Command = rf.log[rf.commitIndex].Command
+		msg.CommandIndex = rf.commitIndex
+		msg.CommandValid = true
+		rf.ch <- msg
+		DPrintf("server %v now commit %v", rf.me, rf.commitIndex)
+	}
+
+	//only heartbeat
 	if len(args.Entries) == 0 {
-		DPrintf("%v got heartbeat from %v", rf.me, args.LeaderId)
 		return
 	}
 
-	//leader append entry
-	reply.Term = rf.currentTerm
-	reply.Success = true
-	if args.Term < rf.currentTerm || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	//leader append entry	
+	if args.Term < rf.currentTerm || (args.PrevLogIndex != -1 && args.PrevLogIndex < len(rf.log) &&
+	 rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+		rf.log = rf.log[:args.PrevLogIndex]
 		reply.Success = false
+		return  
 	}
+	
+	//DPrintf("leader %v send log %v to server %v which now is %v", args.LeaderId, args.Entries, rf.me, rf.log)
 
-	//TO-DO append non-exist entries
+	rf.log = append(rf.log[:args.PrevLogIndex + 1], args.Entries...)
+	DPrintf("server %v now is %v", rf.me, rf.log)
 }
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	DPrintf("do u get here ?")
 	rf.mx.Lock()
+	DPrintf("do u get here ?")
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 	}
 	reply.Term = rf.currentTerm
 	loglen := len(rf.log)
-
+	DPrintf("%v requst vote from %v", args.CandidateId, rf.me)
 	if rf.votedFor == NotVoted || rf.votedFor == args.CandidateId {
 		if args.Term < rf.currentTerm {
 			reply.VoteGranted = false
-		} else if loglen == 0 || args.LastLogTerm > rf.log[loglen - 1].Term ||
+		} else if loglen == 1 || args.LastLogTerm > rf.log[loglen - 1].Term ||
 			(args.LastLogTerm == rf.log[loglen - 1].Term && 
 			args.LastLogIndex >= len(rf.log) - 1) {
 			
@@ -233,12 +259,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 	}
 	rf.mx.Unlock()
-	DPrintf("candidate %v reqvote to %v , got %v, candidate term %v, me term %v ,votedfor %v, argindex %v meindex %v", args.CandidateId, rf.me, 
-	reply.VoteGranted, args.LastLogTerm, rf.currentTerm, rf.votedFor, args.LastLogIndex, len(rf.log) - 1)
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool{
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply, wg *sync.WaitGroup) bool{
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	wg.Done()
 	return ok
 }
 //
@@ -270,11 +295,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, ch chan int) bool {
-
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, wg *sync.WaitGroup) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-
-	ch <- 1
+	wg.Done()
+	DPrintf("a vote got")
 	return ok
 }
 
@@ -294,12 +318,82 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	index := len(rf.log)
+	term := rf.currentTerm
+	isLeader :=  rf.leaderIndex == rf.me
 
+	
+	
 	// Your code here (2B).
+	if isLeader == true {
+		rf.log = append(rf.log, LogEntry{command, rf.currentTerm})
+		DPrintf("leader %v now is %v", rf.me, rf.log)
+		for i := 0 ; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
 
+			go func(target int) {
+				//appendentry for one server until success
+				for {
+					args := AppendEntriesArgs{}
+					args.Term = rf.currentTerm
+					args.LeaderId = rf.me
+					args.PrevLogIndex = rf.nextIndex[target] - 1		
+					args.PrevLogTerm = rf.log[rf.nextIndex[target] - 1].Term
+					args.Entries = []LogEntry {{command, rf.currentTerm}}
+					args.LeaderCommit = rf.commitIndex
+
+					reply := AppendEntriesReply{}
+				
+					var wg sync.WaitGroup
+					wg.Add(1)
+
+					go func() {
+						rf.sendAppendEntries(target, &args, &reply, &wg)
+					}()
+					wg.Wait()
+					
+			
+					if reply.Success == true {
+						rf.mathchIndex[target] = rf.nextIndex[target]
+						rf.nextIndex[target] = rf.nextIndex[target] + 1
+						
+						if rf.commitIndex >= rf.mathchIndex[target] {
+							break
+						}
+
+						majority := (len(rf.peers) - 1) / 2 + 1
+						commitNum := 0
+						
+						for j := 0; j < len(rf.peers); j++ {
+							if rf.mathchIndex[j] >= rf.mathchIndex[target] {
+								commitNum += 1
+							}
+						}
+
+						if commitNum >= majority && rf.log[rf.mathchIndex[target]].Term == rf.currentTerm {
+							DPrintf("leader commit now %v ", rf.mathchIndex[target])
+							rf.commitIndex = rf.mathchIndex[target]
+							msg := ApplyMsg{}
+							msg.Command = rf.log[rf.commitIndex].Command
+							msg.CommandIndex = rf.commitIndex
+							msg.CommandValid = true
+							rf.ch <- msg
+						}
+						break
+					} else {
+						if rf.nextIndex[target] != 1{
+							rf.nextIndex[target] = rf.nextIndex[target] - 1 
+						}
+					}
+
+					time.Sleep(time.Millisecond * 100)
+				}
+
+			}(i)
+		}
+	}
 
 	return index, term, isLeader
 }
@@ -344,9 +438,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	
 	rf.currentTerm = 1
-	rf.log = []LogEntry{}
+	rf.log = []LogEntry{LogEntry{0, 0}}
 	rf.ch = applyCh
 	rf.votedFor = NotVoted
+	
+	rf.heartbeatTime = time.Now()
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.mathchIndex = make([]int, len(rf.peers))
+	
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = len(rf.log)
+		rf.mathchIndex[i] = 0
+	}
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
@@ -357,10 +462,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			for{
 				// 1s = 1000 milliseconds 1000ms
 				//leader send heartbeats, at most 10 heartbeats/s
-				rf.mx.Lock()
-	
+			
 				if rf.me == rf.leaderIndex {
-					DPrintf("%v hearting ", rf.me)
 					for i := 0; i < len(rf.peers); i++ {
 						if i == me {
 						continue
@@ -370,12 +473,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							args := AppendEntriesArgs{}
 							args.Term = rf.currentTerm
 							args.LeaderId = rf.me
-							
-							rf.sendAppendEntries(i, &args, &AppendEntriesReply{})
+							args.LeaderCommit = rf.commitIndex
+							var w sync.WaitGroup
+							w.Add(1)
+							rf.sendAppendEntries(i, &args, &AppendEntriesReply{}, &w)
 						}(i)
 					}
 				}
-				rf.mx.Unlock() 			
+						
 				time.Sleep(100 * time.Millisecond)
 			}
 	}()
@@ -386,7 +491,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		for {
 			time.Sleep(time.Second)
 
-			if rf.me != rf.leaderIndex && time.Now().After(rf.heartbeatTime.Add(time.Millisecond * 150)) {
+			if rf.me != rf.leaderIndex && time.Now().After(rf.heartbeatTime.Add(time.Millisecond * 500)) {
 				
 				DPrintf("%v start election", rf.me)
 			
@@ -409,26 +514,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					args := RequestVoteArgs{}
 					args.Term = rf.currentTerm
 					args.CandidateId = rf.me
-					
-					if len(rf.log) != 0 {
-						args.LastLogIndex = len(rf.log) - 1
-						args.LastLogTerm = rf.log[len(rf.log) - 1].Term
-					} else {
-						args.LastLogIndex = 0
-						args.LastLogTerm = 1
-					}
-		
+					args.LastLogIndex = len(rf.log) - 1
+					args.LastLogTerm = rf.log[len(rf.log) - 1].Term
+
 					reply := RequestVoteReply{}
 					
 					go func(i int){
-						ch := make(chan int)
+						var wg sync.WaitGroup
+						wg.Add(1)
 						go func(){
-							rf.sendRequestVote(i, &args, &reply, ch)
+							rf.sendRequestVote(i, &args, &reply, &wg)
 						}()
 						
-
 						//for synchronization
-						<- ch
+						wg.Wait()
+						DPrintf("got vote ? %v", reply.VoteGranted)
 						if reply.VoteGranted == true {		
 							mutex.Lock()
 							voteGot = voteGot + 1
@@ -436,13 +536,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 								rf.leaderIndex = rf.me
 								rf.currentTerm = rf.currentTerm + 1 
+								
+								//track follower's log state
+								rf.nextIndex = make([]int, len(rf.peers))
+								rf.mathchIndex = make([]int, len(rf.peers))
+								for i := 0; i < len(rf.peers); i++ {
+									rf.nextIndex[i] = len(rf.log)
+									rf.mathchIndex[i] = 0
+								}
 								DPrintf("term %v got leader %v", rf.currentTerm, rf.me)
 							}
 							mutex.Unlock()
 						}
 					}(i)
 				}
-				DPrintf("%v server %v request sent", rf.me, len(rf.peers))
 				<- isTimeout
 				DPrintf("%v election finished with %v got ", rf.me, voteGot)
 			}
