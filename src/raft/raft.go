@@ -565,6 +565,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go func(){
 		//election goroutine 
 		heartbeatTime := time.Now()
+		isLeader := rf.me == rf.leaderIndex
 		for {
 			time.Sleep(time.Millisecond * 500)
 			rf.beatLock.Lock()
@@ -572,7 +573,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			rf.beatLock.Unlock()
 			
 			rf.mx.Lock()
-			isLeader := rf.me == rf.leaderIndex
+			isLeader = rf.me == rf.leaderIndex
 			rf.mx.Unlock()
 
 			if !isLeader && time.Now().After(heartbeatTime.Add(time.Millisecond * 700)) {
