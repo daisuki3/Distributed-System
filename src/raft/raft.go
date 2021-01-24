@@ -28,6 +28,7 @@ import "math/rand"
 
 const NotVoted int = -100
 const NoLeader int = -101
+const NoTerm int = -102
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -207,7 +208,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//update follower commitIndex
 	if args.LeaderCommit > rf.commitIndex {
 		if len(rf.log) - 1 >= rf.commitIndex + 1 && args.PrevLogIndex > rf.commitIndex {
-			DPrintf("leader %v prevlogIndex %v mecommit %v", rf.leaderIndex, args.PrevLogIndex, rf.commitIndex)
+			//DPrintf("leader %v prevlogIndex %v mecommit %v", rf.leaderIndex, args.PrevLogIndex, rf.commitIndex)
 			rf.cond.Broadcast()	
 			rf.cond.L.Lock()
 			rf.cond.L.Unlock()
@@ -249,7 +250,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if reply.Success == true {
 		rf.log = append(rf.log[:args.PrevLogIndex + 1], args.Entries...)
-		DPrintf("server %v loglen %v, leader term %v , me term %v ", rf.me, len(rf.log), args.Term, rf.currentTerm)
+		//DPrintf("server %v loglen %v, leader term %v , me term %v ", rf.me, len(rf.log), args.Term, rf.currentTerm)
 	}
 }
 //
@@ -354,12 +355,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	if isLeader == true {
-
 		if command != rf.log[len(rf.log) - 1].Command {
 			rf.mx.Lock()
 			rf.log = append(rf.log, LogEntry{command, rf.currentTerm})
+			DPrintf("leader %v len %v term %v", rf.me, len(rf.log), rf.currentTerm)
 			rf.mx.Unlock()
-			DPrintf("leader %v  len now is %v", rf.me, len(rf.log))
+			//DPrintf("leader %v  len now is %v", rf.me, len(rf.log))
 		} else {
 			index = len(rf.log) - 1
 		}
@@ -371,11 +372,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			}
 
 			appendWg.Add(1)
+
+			appendTimeout := make(chan bool)
+
+			go func(timeout chan bool) {
+				time.Sleep(time.Millisecond * 100)
+				timeout <- true
+			}(appendTimeout)
+
 			go func(target int) {
 				//AppendEntries for one server until success
 				startTime := time.Now()
 				
-				for time.Now().After(startTime.Add(time.Millisecond * 500)) == false {
+				for time.Now().After(startTime.Add(time.Millisecond * 100)) == false {
 					if rf.mathchIndex[target] >= index {
 						break
 					}
@@ -391,7 +400,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					rf.mx.Unlock()
 
 					reply := AppendEntriesReply{}
-				
+					reply.Term = NoTerm
 					var wg sync.WaitGroup
 					wg.Add(1)
 					go func() {
@@ -435,10 +444,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 						rf.mx.Unlock()
 					}
 
-					time.Sleep(time.Millisecond * 100)
+					time.Sleep(time.Millisecond * 10)
 				}
-				appendWg.Done()
 			}(i)
+
+			<- appendTimeout
+			appendWg.Done()
 		}
 
 		appendWg.Wait()
@@ -547,9 +558,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 								}
 								wg.Done()
 							}()
-						//for synchronization
+					
 							wg.Wait()
-							if reply.Success == false {
+							if reply.Success == false && reply.Term > rf.currentTerm {
 								rf.mx.Lock()
 								rf.leaderIndex = NoLeader
 								rf.mx.Unlock()
@@ -557,7 +568,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						}(i)
 					}
 				}		
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(50 * time.Millisecond)
 			}
 	}()
 	
@@ -567,7 +578,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		heartbeatTime := time.Now()
 		isLeader := rf.me == rf.leaderIndex
 		for {
-			time.Sleep(time.Millisecond * 500)
+			time.Sleep(time.Millisecond * 900)
 			rf.beatLock.Lock()
 			heartbeatTime = rf.heartbeatTime
 			rf.beatLock.Unlock()
@@ -579,6 +590,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			if !isLeader && time.Now().After(heartbeatTime.Add(time.Millisecond * 700)) {
 				isTimeout := make(chan bool)
 				rf.mx.Lock()
+				//DPrintf("me %v leader %v term %v", rf.me, rf.leaderIndex, rf.currentTerm)
 				rf.electionNum += 1
 				rf.votedFor = rf.me
 				rf.mx.Unlock()
@@ -630,6 +642,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						if reply.VoteGranted == true {		
 							mutex.Lock()
 							voteGot = voteGot + 1
+
 							rf.mx.Lock()
 							isLeader = rf.me == rf.leaderIndex
 							rf.mx.Unlock()
@@ -638,14 +651,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 								rf.mx.Lock()
 								rf.leaderIndex = rf.me
 								rf.currentTerm = rf.currentTerm + 1 
-								
+								rf.electionNum = 1
 								//track follower's log state
 								for i := 0; i < len(rf.peers); i++ {
 									rf.nextIndex[i] = 1
 									rf.mathchIndex[i] = 0
 								}
 								rf.mx.Unlock()
-								DPrintf("term %v got leader %v", rf.currentTerm, rf.me)
+								DPrintf("term %v got leader %v got %v vote", rf.currentTerm, rf.me, voteGot)
 							}
 							mutex.Unlock()
 						}
