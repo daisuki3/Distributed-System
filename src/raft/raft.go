@@ -263,9 +263,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mx.Lock()
 	defer rf.mx.Unlock()
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-	}
 
 	reply.Term = rf.currentTerm
 	loglen := len(rf.log)
@@ -518,11 +515,8 @@ func (rf *Raft) sendHeartBeat() {
 			wg.Add(1)	
 			go func(){
 				startTime := time.Now()
-				var once sync.Once 
 				for time.Now().After(startTime.Add(time.Millisecond * 25)) == false {
-					once.Do(func (){
-						rf.sendAppendEntries(i, &args, &reply)
-					})
+					rf.sendAppendEntries(i, &args, &reply)
 					time.Sleep(time.Millisecond * 10)
 				}
 				wg.Done()
@@ -595,7 +589,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			if rf.state == Leader {
 				rf.mx.Unlock( )
 				DPrintf("enter expire me %v state %v", rf.me, rf.state)
-				time.Sleep(time.Second * 3)
+				time.Sleep(time.Second * 2)
 				rf.mx.Lock()
 				majority := (len(rf.peers) - 1) / 2 + 1
 				count := 0
@@ -616,7 +610,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.mx.Unlock()
 			} else {
 				rf.mx.Unlock()
-				time.Sleep(time.Second)
+				time.Sleep(time.Millisecond * 500)
 			}
 			rf.leaseMx.Unlock()
 		}
