@@ -22,8 +22,8 @@ import "sync/atomic"
 import "../labrpc"
 import "time"
 import "math/rand"
-// import "bytes"
-// import "../labgob"
+import "bytes"
+import "../labgob"
 
 
 const NotVoted int = -100
@@ -127,6 +127,15 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.votedForElection)
+	e.Encode(rf.log)
+	e.Encode(rf.electionNum)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -150,6 +159,27 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var votedForElection int
+	var log []LogEntry
+	var electionNum int 
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&votedForElection) != nil ||
+		d.Decode(&log) != nil ||
+		d.Decode(&electionNum) != nil {
+			DPrintf("persist read wrong")
+			return 
+		} else {
+			rf.currentTerm = currentTerm
+			rf.votedFor = votedFor
+			rf.votedForElection = votedForElection
+			rf.log = log
+			rf.electionNum = electionNum
+		}
 }
 
 //
@@ -203,11 +233,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//leader heartbeat
 	rf.votedFor = NotVoted
 	rf.votedForElection = NotVoted
+	rf.persist()
 	reply.Term = rf.currentTerm
 	reply.Success = true
 	
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+		rf.persist()
 	}
 
 
@@ -226,13 +258,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//leader append entry	
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
+		rf.persist()
 		return 
 	}
 
 	if args.Term < rf.currentTerm || (args.PrevLogIndex > 0 && args.PrevLogIndex < len(rf.log) &&
 	 rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
-		rf.log = rf.log[:args.PrevLogIndex]
+		rf.log = rf.log[: args.PrevLogIndex]
 		reply.Success = false
+		rf.persist()
 		return  
 	}
 	
@@ -247,9 +281,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if reply.Success == true {
 		rf.log = append(rf.log[:args.PrevLogIndex + 1], args.Entries...)
+		rf.persist()
 		//DPrintf("server %v loglen %v, leader term %v , me term %v ", rf.me, len(rf.log), args.Term, rf.currentTerm)
 	}
-
+	
 	if args.LeaderCommit > rf.commitIndex {
 		if len(rf.log) - 1 >= rf.commitIndex + 1{ //&& args.PrevLogIndex > rf.commitIndex {
 			rf.cond.Broadcast()
@@ -279,44 +314,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.votedFor = args.CandidateId
 				rf.votedForElection = args.ElectionNum
 				reply.VoteGranted = true
+				rf.persist()
 			} else if args.ElectionNum == rf.electionNum &&
 				(rf.votedFor == NotVoted || rf.votedFor == args.CandidateId) {
 				DPrintf("server %v term %v got vote from %v  term %v, more up-to-date", args.CandidateId, args.Term,
 					rf.me, rf.currentTerm)
 				rf.votedFor = args.CandidateId
 				reply.VoteGranted = true
+				rf.persist()
 			}
 	} else {
 		reply.VoteGranted = false
 	}
-
-	/*
-	if rf.votedFor == NotVoted || rf.votedFor == args.CandidateId {
-
-		if args.Term < rf.currentTerm {
-			reply.VoteGranted = false
-		} else if loglen == 1 || args.LastLogTerm > rf.log[loglen - 1].Term ||
-			(args.LastLogTerm == rf.log[loglen - 1].Term && 
-			args.LastLogIndex >= len(rf.log) - 1) {		
-				DPrintf("server %v term %v got vote from %v  term %v, more up-to-date", args.CandidateId, args.Term,
-				rf.me, rf.currentTerm)
-			rf.votedFor = args.CandidateId
-			reply.VoteGranted = true
-		}
-	} else if args.ElectionNum > rf.electionNum && args.Term >= rf.currentTerm {
-		DPrintf("server %v term %v got vote from %v term %v, timeout and wakeup, electionNum %v me %v", args.CandidateId, args.Term,
-		rf.me, rf.currentTerm, args.ElectionNum, rf.electionNum)
-		if loglen == 1 || args.LastLogTerm > rf.log[loglen - 1].Term ||
-			(args.LastLogTerm == rf.log[loglen - 1].Term &&
-				args.LastLogIndex >= len(rf.log) - 1) {
-			rf.votedFor = args.CandidateId
-			rf.electionNum = args.ElectionNum
-			reply.VoteGranted = true
-		}
-	} else {
-		reply.VoteGranted = false
-	}
-	*/
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool{
@@ -386,6 +395,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		if command != rf.log[len(rf.log) - 1].Command {
 			rf.mx.Lock()
 			rf.log = append(rf.log, LogEntry{command, rf.currentTerm})
+			rf.persist()
 			DPrintf("leader %v len %v term %v", rf.me, len(rf.log), rf.currentTerm)
 			rf.mx.Unlock()
 		} else {
@@ -623,13 +633,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.electionLock.Lock()
 				isTimeout := make(chan bool)
 				rf.mx.Lock()
-				DPrintf("server %v state %v start election term %v \n", rf.me, rf.state, rf.currentTerm)
+				DPrintf("server %v state %v start election term %v loglen %v\n", rf.me, rf.state, rf.currentTerm, len(rf.log))
 				rf.electionNum += 1
 				if rf.electionNum > 5 {
 					rf.electionNum = 1
 				}
 				rf.votedFor = rf.me
 				rf.state = Candidate
+				rf.persist()
 				rf.mx.Unlock()
 				//DPrintf("%v start election ,out of time ? %v ", rf.me, time.Now().After(heartbeatTime.Add(time.Millisecond * 700)))
 				//timeout 250 ~ 400 Millisecond
@@ -693,6 +704,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 								rf.state = Leader
 								rf.currentTerm = rf.currentTerm + 1 
 								rf.electionNum = 1
+								rf.persist()
 								//track follower's log state
 								for i := 0; i < len(rf.peers); i++ {
 									rf.nextIndex[i] = 1
@@ -719,6 +731,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						} else if reply.Term > rf.currentTerm {
 							rf.mx.Lock()
 							rf.electionNum = 1
+							rf.persist()
 							rf.mx.Unlock()
 						}
 					}(i)
